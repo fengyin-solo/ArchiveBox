@@ -10,7 +10,7 @@ from signal_webhooks.utils import get_webhook_model, model_from_reference
 
 from archivebox.base_models.admin import BaseModelAdmin
 
-from archivebox.api.models import APIToken
+from archivebox.api.models import APIToken, IdempotencyKey
 
 
 def _webhook_fields(*names: str) -> tuple[str, ...]:
@@ -51,6 +51,76 @@ class APITokenAdmin(BaseModelAdmin):
     list_filter = ("created_by",)
     ordering = ["-created_at"]
     list_per_page = 100
+
+
+class IdempotencyKeyAdmin(BaseModelAdmin):
+    list_display = (
+        "created_at",
+        "created_by",
+        "request_method",
+        "request_path",
+        "key",
+        "status",
+        "locked_at",
+        "completed_at",
+        "expires_at",
+    )
+    sort_fields = ("created_at", "created_by", "request_method", "request_path", "status", "expires_at")
+    search_fields = ("id", "key", "request_path", "request_hash", "created_by__username")
+    list_filter = ("status", "request_method", "created_by")
+    ordering = ["-created_at"]
+    list_per_page = 100
+
+    readonly_fields = (
+        "id",
+        "created_by",
+        "created_at",
+        "modified_at",
+        "key",
+        "request_method",
+        "request_path",
+        "request_hash",
+        "status",
+        "status_code",
+        "response_content_type",
+        "response_body",
+        "locked_at",
+        "completed_at",
+        "expires_at",
+    )
+
+    fieldsets = (
+        (
+            "Request",
+            {
+                "fields": ("key", "request_method", "request_path", "request_hash", "created_by"),
+                "classes": ("card",),
+            },
+        ),
+        (
+            "Response",
+            {
+                "fields": ("status", "status_code", "response_content_type", "response_body"),
+                "classes": ("card",),
+            },
+        ),
+        (
+            "Lifecycle",
+            {
+                "fields": ("locked_at", "completed_at", "expires_at", "created_at", "modified_at"),
+                "classes": ("card",),
+            },
+        ),
+    )
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj=None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj=None) -> bool:
+        return False
 
 
 class OutboundWebhookAdminForm(WebhookModelForm):
@@ -117,4 +187,5 @@ class CustomWebhookAdmin(WebhookAdmin, BaseModelAdmin):
 
 def register_admin(admin_site: admin.AdminSite) -> None:
     admin_site.register(APIToken, APITokenAdmin)
+    admin_site.register(IdempotencyKey, IdempotencyKeyAdmin)
     admin_site.register(get_webhook_model(), CustomWebhookAdmin)

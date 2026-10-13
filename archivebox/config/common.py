@@ -331,6 +331,11 @@ class ServerConfig(BaseConfigSet):
     PUBLIC_INDEX: bool = Field(default=True)
     PUBLIC_ADD_VIEW: bool = Field(default=False)
 
+    # How long completed Idempotency-Key records stay replayable (days).
+    # After this age the key may be reused by a new request. 0 disables
+    # replay retention (each retry executes again).
+    IDEMPOTENCY_KEY_RETENTION_DAYS: int = Field(default=30, ge=0)
+
     ADMIN_USERNAME: str | None = Field(default=None)
     ADMIN_PASSWORD: str | None = Field(default=None)
 

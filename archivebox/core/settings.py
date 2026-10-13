@@ -97,6 +97,10 @@ MIDDLEWARE = [
     "archivebox.core.middleware.ReverseProxyAuthMiddleware",
     "archivebox.core.middleware.ServerSecurityModeMiddleware",
     "archivebox.core.middleware.HostRoutingMiddleware",
+    # Innermost layer: idempotency replay/conflict responses still pass through
+    # every auth/security middleware above on the way in, and CORS/cache
+    # wrappers on the way out.
+    "archivebox.api.idempotency.IdempotencyMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     # Additional middlewares from plugins (if any)
 ]

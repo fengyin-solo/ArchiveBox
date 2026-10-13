@@ -27,6 +27,6 @@ class ApiCorsMiddleware:
 
         response["Access-Control-Allow-Origin"] = "*"
         response["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response["Access-Control-Allow-Headers"] = "Authorization, X-ArchiveBox-API-Key, Content-Type, X-CSRFToken"
+        response["Access-Control-Allow-Headers"] = "Authorization, X-ArchiveBox-API-Key, Content-Type, X-CSRFToken, Idempotency-Key"
         response["Access-Control-Max-Age"] = "600"
         return response
