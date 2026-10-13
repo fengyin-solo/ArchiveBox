@@ -75,6 +75,8 @@ class NinjaAPIWithIOCapture(NinjaAPI):
         response["X-ArchiveBox-Auth-Method"] = str(request.__dict__.get("_api_auth_method", "None"))
         response["X-ArchiveBox-Auth-Expires"] = token_expiry
         response["X-ArchiveBox-Auth-Token-Id"] = str(api_token.id) if api_token else "None"
+        response["X-ArchiveBox-Auth-Token-Scope"] = api_token.effective_scope if api_token else "None"
+        response["X-ArchiveBox-Auth-Token-Status"] = api_token.status if api_token else "None"
         response["X-ArchiveBox-Auth-User-Id"] = str(request.user.pk) if request.user.pk else "None"
         response["X-ArchiveBox-Auth-User-Username"] = request.user.username if isinstance(request.user, User) else "None"
 

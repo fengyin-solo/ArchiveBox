@@ -19,23 +19,38 @@ def _webhook_fields(*names: str) -> tuple[str, ...]:
 
 
 class APITokenAdmin(BaseModelAdmin):
-    list_display = ("created_at", "id", "created_by", "token_redacted", "expires")
-    sort_fields = ("id", "created_at", "created_by", "expires")
-    readonly_fields = ("created_at", "modified_at")
-    search_fields = ("id", "created_by__username", "token")
+    list_display = ("created_at", "id", "created_by", "token_redacted", "label", "scope", "status", "expires", "last_used_at")
+    sort_fields = ("id", "created_at", "created_by", "expires", "scope", "status", "last_used_at", "label")
+    readonly_fields = ("created_at", "modified_at", "last_used_at", "last_used_ip", "token_redacted")
+    search_fields = ("id", "created_by__username", "token", "label")
 
     fieldsets = (
         (
             "Token",
             {
-                "fields": ("token", "expires"),
+                "fields": ("token", "token_redacted", "expires", "status"),
                 "classes": ("card",),
+            },
+        ),
+        (
+            "Access Scope",
+            {
+                "fields": ("scope", "resource_paths", "label"),
+                "classes": ("card",),
+                "description": "Leave scope blank for legacy tokens (treated as Admin until the token is first saved).",
             },
         ),
         (
             "Owner",
             {
                 "fields": ("created_by",),
+                "classes": ("card",),
+            },
+        ),
+        (
+            "Usage",
+            {
+                "fields": ("last_used_at", "last_used_ip"),
                 "classes": ("card",),
             },
         ),
@@ -48,7 +63,7 @@ class APITokenAdmin(BaseModelAdmin):
         ),
     )
 
-    list_filter = ("created_by",)
+    list_filter = ("created_by", "scope", "status")
     ordering = ["-created_at"]
     list_per_page = 100
 
