@@ -40,6 +40,27 @@ def test_schedule_api_creates_schedule_via_view_request(api_admin_user):
     assert len(response["result"]["created_schedule_ids"]) == 1
 
 
+@pytest.mark.django_db
+def test_schedule_api_persists_timezone_and_backfill_options(api_admin_user):
+    request = RequestFactory().post("/api/v1/cli/schedule")
+    request.user = api_admin_user
+    setattr(request, "stdout", StringIO())
+    setattr(request, "stderr", StringIO())
+    args = ScheduleCommandSchema(
+        every="daily",
+        import_path="https://example.com/feed.xml",
+        quiet=True,
+        timezone="America/New_York",
+        max_backfill=3,
+    )
+
+    cli_schedule(request, args)
+
+    schedule = CrawlSchedule.objects.get()
+    assert schedule.timezone_name == "America/New_York"
+    assert schedule.max_backfill_runs == 3
+
+
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.timeout(180)
 def test_api_v1_cli_schedule_creates_schedule_over_server(tmp_path, recursive_test_site):

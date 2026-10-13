@@ -1768,10 +1768,10 @@ def run_pending_crawls(
             last_retention_at = now_monotonic
 
         if daemon and crawl_id is None:
-            now = timezone.now()
-            for schedule in CrawlSchedule.objects.filter(is_enabled=True).select_related("template", "template__created_by"):
-                if schedule.is_due(now):
-                    schedule.dispatch(queued_at=now)
+            # Every schedule period is claimed through the persistent ledger;
+            # the same gate backs `archivebox schedule --run-all`, so duplicate
+            # runners can never materialize the same period twice.
+            CrawlSchedule.dispatch_due(source="runner")
 
         if maintenance_only:
             # Filesystem migration is independent of lifecycle status; do not

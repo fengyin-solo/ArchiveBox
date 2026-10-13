@@ -1355,16 +1355,16 @@ def get_http_response(
 
 
 def make_latest_schedule_due(cwd: Path) -> None:
-    from archivebox.crawls.models import Crawl, CrawlSchedule
+    from archivebox.crawls.models import CrawlSchedule
     from archivebox.tests.test_orm_helpers import use_archivebox_db
     from django.utils import timezone
 
     with use_archivebox_db(cwd):
         schedule = CrawlSchedule.objects.order_by("-created_at").select_related("template").first()
         assert schedule is not None
-        Crawl.objects.filter(pk=schedule.template_id).update(
-            created_at=timezone.now() - timedelta(days=2),
-            modified_at=timezone.now() - timedelta(days=2),
+        # The run ledger cursor (not the template row) decides due periods.
+        CrawlSchedule.objects.filter(pk=schedule.pk).update(
+            last_planned_run_at=timezone.now() - timedelta(days=2),
         )
 
 

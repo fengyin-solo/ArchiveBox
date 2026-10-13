@@ -1,7 +1,9 @@
 __package__ = "archivebox.crawls"
 
+import logging
 from typing import TYPE_CHECKING, Any
 from collections.abc import Iterable, Mapping
+import os
 import uuid
 import json
 import re
@@ -32,11 +34,137 @@ from archivebox.base_models.models import (
     get_or_create_system_user_pk,
 )
 from archivebox.workers.models import ModelWithQueue
-from archivebox.crawls.schedule_util import next_run_for_schedule, validate_schedule
+from archivebox.crawls.schedule_util import (
+    PLANNED_RUN_DST_AMBIGUOUS,
+    REASON_BACKFILL_LIMITED,
+    REASON_CRAWL_CANCELLED,
+    REASON_CRAWL_DELETED,
+    REASON_DST_AMBIGUOUS_FIRST,
+    REASON_DST_GAP,
+    REASON_INVALID_CRON,
+    REASON_INVALID_TIMEZONE,
+    REASON_SCHEDULE_DISABLED,
+    REASON_SCHEDULE_MODIFIED,
+    REASON_STALE_CLAIM,
+    REASON_TEMPLATE_MODIFIED,
+    iter_planned_runs,
+    next_run_for_schedule,
+    validate_schedule,
+    validate_timezone,
+)
 from archivebox.misc.util import parse_date, sanitize_html_text, validate_url, validate_url_length
 
 if TYPE_CHECKING:
     from archivebox.core.models import Snapshot
+
+logger = logging.getLogger(__name__)
+
+# An update-kind claim runs maintenance synchronously in the claiming process.
+# If that process dies between the claim INSERT and the finalizing UPDATE, the
+# row is failed by reconciliation after this grace period.
+STALE_UPDATE_CLAIM_SECONDS = 30 * 60
+
+# Definition fields whose change invalidates any not-yet-started claimed run.
+SCHEDULE_DEFINITION_FIELDS = frozenset({"schedule", "timezone_name", "config", "template_id", "max_backfill_runs"})
+
+# Content fields of a template Crawl whose edit invalidates pending claims.
+TEMPLATE_CONTENT_FIELDS = frozenset({"urls", "max_depth", "tags_str", "config", "persona_id", "label", "notes"})
+
+
+def _is_database_lock_error(exc: Exception) -> bool:
+    from django.db import DatabaseError
+
+    if not isinstance(exc, DatabaseError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "could not obtain lock" in message or "deadlock detected" in message
+
+
+def current_schedule_owner(source: str) -> str:
+    """Stable auditable owner label: machine guid + pid + trigger source."""
+    try:
+        from archivebox.machine.models import Machine
+
+        machine_guid = Machine.current().guid
+    except Exception:
+        logger.warning("Unable to resolve current Machine guid for schedule owner label", exc_info=True)
+        machine_guid = "unknown-machine"
+    return f"{machine_guid}:{os.getpid()}:{source}"[-128:]
+
+
+class CrawlScheduleRun(ModelWithUUID):
+    """One durable ledger row per (schedule, planned cron period).
+
+    The database unique constraint on (schedule, planned_at) is the only
+    cross-process claim gate: duplicate runners and admin run-all can race at
+    SQLite/PostgreSQL, but exactly one INSERT can win.
+    """
+
+    class StatusChoices(models.TextChoices):
+        CLAIMED = "claimed", "Claimed"
+        SUCCEEDED = "succeeded", "Succeeded"
+        FAILED = "failed", "Failed"
+        SKIPPED = "skipped", "Skipped"
+        CANCELLED = "cancelled", "Cancelled"
+
+    schedule: "CrawlSchedule" = models.ForeignKey("CrawlSchedule", on_delete=models.CASCADE, related_name="runs", null=False)  # type: ignore
+    planned_at = models.DateTimeField(null=False, blank=False, db_index=True)
+    started_at = models.DateTimeField(default=timezone.now, null=False)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=15, choices=StatusChoices.choices, default=StatusChoices.CLAIMED, null=False, db_index=True)
+    reason = models.CharField(max_length=32, blank=True, null=False, default="")
+    message = models.TextField(blank=True, null=False, default="")
+    owner = models.CharField(max_length=128, blank=True, null=False, default="")
+    source = models.CharField(max_length=32, blank=True, null=False, default="")
+    run_kind = models.CharField(max_length=16, null=False, blank=False)
+    crawl: "Crawl | None" = models.ForeignKey(
+        "Crawl",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="schedule_runs",
+    )
+
+    class Meta(ModelWithUUID.Meta):
+        app_label = "crawls"
+        verbose_name = "Scheduled Crawl Run"
+        verbose_name_plural = "Scheduled Crawl Runs"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["schedule", "planned_at"],
+                name="csrun_sched_planned_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["schedule", "status"], name="csrun_sched_status_idx"),
+            models.Index(fields=["status", "planned_at"], name="csrun_status_planned_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.id}] schedule={self.schedule_id} planned={self.planned_at.isoformat()} {self.status}"
+
+    def finalize(self, status: str, *, reason: str = "", message: str = "", now=None) -> bool:
+        now = now or timezone.now()
+        updated = (
+            type(self)
+            .objects.filter(pk=self.pk, status=self.StatusChoices.CLAIMED)
+            .update(
+                status=status,
+                reason=reason or self.reason,
+                message=message or self.message,
+                finished_at=now,
+                modified_at=now,
+            )
+        )
+        if updated:
+            self.status = status
+            self.reason = reason or self.reason
+            self.message = message or self.message
+            self.finished_at = now
+        return updated == 1
+
+    def cancel(self, reason: str, *, now=None, message: str = "") -> bool:
+        return self.finalize(self.StatusChoices.CANCELLED, reason=reason, message=message, now=now)
 
 
 class CrawlSchedule(ModelWithUUID, ModelWithNotes):
@@ -47,12 +175,32 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
 
     template: "Crawl" = models.ForeignKey("Crawl", on_delete=models.CASCADE, null=False, blank=False)  # type: ignore
     schedule = models.CharField(max_length=64, blank=False, null=False)
+    timezone_name = models.CharField(max_length=64, blank=True, null=False, default="", verbose_name="timezone")
+    max_backfill_runs = models.PositiveSmallIntegerField(
+        default=1,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(100)],
+        help_text="Maximum number of missed periods to run when catching up after downtime. Older periods are recorded as skipped.",
+    )
     is_enabled = models.BooleanField(default=True)
     config = models.JSONField(default=dict, null=True, blank=True)
     label = models.CharField(max_length=64, blank=True, null=False, default="")
     notes = models.TextField(blank=True, null=False, default="")
 
+    # Persistent scheduling cursor and auditable state.
+    last_planned_run_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    missed_runs_skipped = models.PositiveBigIntegerField(default=0, null=False)
+    last_skip_at = models.DateTimeField(null=True, blank=True)
+    last_skip_count = models.PositiveBigIntegerField(default=0, null=False)
+    last_skip_first_at = models.DateTimeField(null=True, blank=True)
+    last_skip_last_at = models.DateTimeField(null=True, blank=True)
+    last_skip_reason = models.CharField(max_length=32, blank=True, null=False, default="")
+    last_error_at = models.DateTimeField(null=True, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True, null=False, default="")
+    last_error_message = models.TextField(blank=True, null=False, default="")
+
     crawl_set: models.Manager["Crawl"]
+    runs: models.Manager[CrawlScheduleRun]
 
     class Meta(ModelWithUUID.Meta, ModelWithNotes.Meta):
         app_label = "crawls"
@@ -75,7 +223,18 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
             self.notes = sanitize_html_text(self.notes)
         self.schedule = (self.schedule or "").strip()
         validate_schedule(self.schedule)
+        self.timezone_name = validate_timezone(self.timezone_name)
         self.label = self.label or (sanitize_html_text(self.template.label).strip() if self.template else "")
+
+        previous = None
+        tracked_fields = {"is_enabled", *SCHEDULE_DEFINITION_FIELDS}
+        tracked_update_fields = set(update_fields) & tracked_fields if update_fields is not None else tracked_fields
+        # Always read the full tracked row: deciding the enable/disable
+        # transition requires the current is_enabled value even when the
+        # caller's update_fields omits it.
+        if self.pk and tracked_update_fields:
+            previous = type(self).objects.filter(pk=self.pk).values(*tracked_fields).first()
+
         super().save(*args, **kwargs)
         if self.template:
             self.template.safe_update(
@@ -88,40 +247,386 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
             self.template.schedule_id = self.pk
             self.template.schedule = self
 
+        if previous is None:
+            return
+        now = timezone.now()
+        definition_changed = any(
+            field != "is_enabled" and previous.get(field) != _schedule_field_value(self, field) for field in tracked_update_fields
+        )
+        was_enabled = bool(previous.get("is_enabled"))
+        if was_enabled and not self.is_enabled:
+            self.cancel_open_claims(REASON_SCHEDULE_DISABLED, now=now)
+            self._reset_cursor(now)
+        elif not was_enabled and self.is_enabled:
+            # Re-enabling anchors cron at the enable moment so the disabled
+            # window never produces a catch-up burst.
+            self._reset_cursor(now)
+        elif definition_changed:
+            self.cancel_open_claims(REASON_SCHEDULE_MODIFIED, now=now)
+            self._reset_cursor(now)
+
+    @classmethod
+    def disable_many(cls, queryset, *, now=None) -> int:
+        """Bulk-disable path that still clears claims and resets each cursor."""
+        now = now or timezone.now()
+        disabled = 0
+        for schedule in queryset.filter(is_enabled=True):
+            schedule.is_enabled = False
+            schedule.save(update_fields=["is_enabled", "modified_at"])
+            disabled += 1
+        return disabled
+
+    @property
+    def kind(self) -> str:
+        return str((self.config or {}).get("SCHEDULE_KIND") or "crawl")
+
+    @property
+    def scheduling_anchor(self):
+        """Exclusive lower bound for cron fire enumeration (UTC)."""
+        return self.last_planned_run_at or self.created_at
+
     @property
     def last_run_at(self):
-        if self.kind == "update":
-            return self.modified_at
-        latest_crawl = self.crawl_set.order_by("-created_at").first()
-        if latest_crawl:
-            return latest_crawl.created_at
-        if self.template:
-            return self.template.created_at
-        return self.created_at
+        return self.scheduling_anchor
 
     @property
     def next_run_at(self):
-        return next_run_for_schedule(self.schedule, self.last_run_at)
+        return next_run_for_schedule(self.schedule, self.scheduling_anchor, self.timezone_name)
 
     def is_due(self, now=None) -> bool:
         now = now or timezone.now()
         return self.is_enabled and self.next_run_at <= now
 
     @property
-    def kind(self) -> str:
-        return str((self.config or {}).get("SCHEDULE_KIND") or "crawl")
+    def has_open_claim(self) -> bool:
+        return self.runs.filter(status=CrawlScheduleRun.StatusChoices.CLAIMED).exists()
+
+    # ------------------------------------------------------------------
+    # Claim lifecycle
+    # ------------------------------------------------------------------
+
+    def _reset_cursor(self, now=None) -> None:
+        """Anchor cron evaluation at ``now`` so disable/modify causes no catch-up."""
+        now = now or timezone.now()
+        type(self).objects.filter(pk=self.pk).update(last_planned_run_at=now, modified_at=now)
+        self.last_planned_run_at = now
+
+    def record_error(self, code: str, message: str, *, now=None) -> None:
+        now = now or timezone.now()
+        type(self).objects.filter(pk=self.pk).update(
+            last_error_at=now,
+            last_error_code=code[:64],
+            last_error_message=message[:4096],
+            modified_at=now,
+        )
+        self.last_error_at = now
+        self.last_error_code = code[:64]
+        self.last_error_message = message[:4096]
+        logger.warning("CrawlSchedule %s claim blocked: %s: %s", self.pk, code, message)
+
+    def _clear_error(self) -> None:
+        if not self.last_error_code:
+            return
+        type(self).objects.filter(pk=self.pk).update(
+            last_error_at=None,
+            last_error_code="",
+            last_error_message="",
+        )
+        self.last_error_at = None
+        self.last_error_code = ""
+        self.last_error_message = ""
+
+    def reconcile_runs(self, *, now=None) -> int:
+        """Resolve claimed rows whose crawl finished, vanished, or whose owner died."""
+        now = now or timezone.now()
+        reconciled = 0
+        claimed_runs = list(
+            self.runs.filter(status=CrawlScheduleRun.StatusChoices.CLAIMED).select_related("crawl"),
+        )
+        for run in claimed_runs:
+            if run.crawl_id is None:
+                if run.run_kind == "update" and run.started_at <= now - timedelta(seconds=STALE_UPDATE_CLAIM_SECONDS):
+                    if run.finalize(
+                        CrawlScheduleRun.StatusChoices.FAILED,
+                        reason=REASON_STALE_CLAIM,
+                        message="Claiming process did not finish scheduled maintenance before the stale-claim deadline.",
+                        now=now,
+                    ):
+                        reconciled += 1
+                continue
+            crawl = run.crawl
+            if crawl is None:
+                if run.finalize(
+                    CrawlScheduleRun.StatusChoices.FAILED,
+                    reason=REASON_CRAWL_DELETED,
+                    message="The materialized Crawl was deleted before the run finished.",
+                    now=now,
+                ):
+                    reconciled += 1
+            elif crawl.status == Crawl.StatusChoices.SEALED:
+                if run.finalize(CrawlScheduleRun.StatusChoices.SUCCEEDED, now=now):
+                    reconciled += 1
+        return reconciled
+
+    def cancel_open_claims(self, reason: str, *, now=None, message: str = "") -> int:
+        """Cancel claimed runs whose crawl has not STARTED; seal queued crawls."""
+        now = now or timezone.now()
+        cancelled = 0
+        for run in self.runs.filter(status=CrawlScheduleRun.StatusChoices.CLAIMED):
+            if run.crawl_id is not None:
+                # Only a still-QUEUED materialized crawl may be sealed here. A
+                # crawl that already STARTED keeps its claim; the conditional
+                # UPDATE makes that decision at the database, not by timestamp.
+                sealed = Crawl.objects.filter(pk=run.crawl_id, status=Crawl.StatusChoices.QUEUED).update(
+                    status=Crawl.StatusChoices.SEALED,
+                    retry_at=now,
+                    modified_at=now,
+                )
+                if not sealed:
+                    continue
+            if run.cancel(reason, message=message, now=now):
+                cancelled += 1
+        return cancelled
+
+    def invalidate_for_template_change(self, changed_fields: set[str], *, now=None) -> int:
+        if not (changed_fields & TEMPLATE_CONTENT_FIELDS):
+            return 0
+        return self.cancel_open_claims(
+            REASON_TEMPLATE_MODIFIED,
+            now=now,
+            message="The schedule template was modified before the claimed run started.",
+        )
+
+    def _record_skipped_period(self, planned, *, source: str, owner: str, now) -> CrawlScheduleRun | None:
+        message = (
+            f"Local wall time {planned.wall_time.isoformat()} does not exist in "
+            f"{self.timezone_name or settings.TIME_ZONE} on this date (spring-forward DST gap); the period was not run."
+        )
+        try:
+            with transaction.atomic():
+                run = CrawlScheduleRun(
+                    schedule=self,
+                    planned_at=planned.planned_at,
+                    started_at=now,
+                    finished_at=now,
+                    status=CrawlScheduleRun.StatusChoices.SKIPPED,
+                    reason=REASON_DST_GAP,
+                    message=message,
+                    owner=owner,
+                    source=source,
+                    run_kind=self.kind,
+                )
+                run.save()
+                self._advance_cursor(planned.planned_at)
+        except IntegrityError:
+            return None
+        return run
+
+    def _advance_cursor(self, planned_at) -> None:
+        type(self).objects.filter(pk=self.pk, last_planned_run_at=self.last_planned_run_at).update(
+            last_planned_run_at=planned_at,
+        )
+        self.last_planned_run_at = planned_at
+
+    def _record_backfill_skip(self, dropped, *, truncated: bool, now) -> None:
+        count = len(dropped)
+        message = f"{count} missed period(s) exceeded max_backfill_runs={self.max_backfill_runs} and were not run."
+        if truncated:
+            message += " The enumeration safety cap was also reached; older periods are uncounted."
+        type(self).objects.filter(pk=self.pk).update(
+            missed_runs_skipped=models.F("missed_runs_skipped") + count,
+            last_skip_at=now,
+            last_skip_count=count,
+            last_skip_first_at=dropped[0].planned_at,
+            last_skip_last_at=dropped[-1].planned_at,
+            last_skip_reason=REASON_BACKFILL_LIMITED,
+            modified_at=now,
+        )
+        self.missed_runs_skipped = (self.missed_runs_skipped or 0) + count
+        self.last_skip_at = now
+        self.last_skip_count = count
+        self.last_skip_first_at = dropped[0].planned_at
+        self.last_skip_last_at = dropped[-1].planned_at
+        self.last_skip_reason = REASON_BACKFILL_LIMITED
+
+    def claim_run(self, planned, *, source: str, owner: str, now) -> CrawlScheduleRun | None:
+        """Atomically claim one cron period; the (schedule, planned_at) unique
+        constraint is the cross-process gate. Crawl materialization happens in
+        the same short transaction so a losing race rolls the Crawl back too."""
+        reason = REASON_DST_AMBIGUOUS_FIRST if planned.kind == PLANNED_RUN_DST_AMBIGUOUS else ""
+        message = ""
+        if reason:
+            message = (
+                f"Local wall time {planned.wall_time.isoformat()} is ambiguous in "
+                f"{self.timezone_name or settings.TIME_ZONE} (fall-back DST repeat); the first physical occurrence was used."
+            )
+        try:
+            with transaction.atomic():
+                run = CrawlScheduleRun(
+                    schedule=self,
+                    planned_at=planned.planned_at,
+                    started_at=now,
+                    status=CrawlScheduleRun.StatusChoices.CLAIMED,
+                    reason=reason,
+                    message=message,
+                    owner=owner,
+                    source=source,
+                    run_kind=self.kind,
+                )
+                run.save()
+                if self.kind != "update":
+                    run.crawl = self.enqueue(queued_at=now)
+                    run.save(update_fields=["crawl", "modified_at"])
+                self._advance_cursor(planned.planned_at)
+        except IntegrityError:
+            return None
+        return run
+
+    def _execute_claimed_maintenance(self, run: CrawlScheduleRun, *, now) -> None:
+        from archivebox.cli.archivebox_update import run_scheduled_maintenance
+
+        try:
+            run_scheduled_maintenance()
+        except Exception as exc:
+            run.finalize(
+                CrawlScheduleRun.StatusChoices.FAILED,
+                reason="maintenance_error",
+                message=f"{type(exc).__name__}: {exc}"[:4096],
+                now=now,
+            )
+            raise
+        run.finalize(CrawlScheduleRun.StatusChoices.SUCCEEDED, now=now)
+
+    def evaluate(self, *, now=None, source: str = "runner", force: bool = False) -> dict:
+        """Reconcile, then claim due periods for this one schedule.
+
+        ``force`` (admin run-all / legacy dispatch) claims the next planned
+        period early instead of waiting for its wall time. Every claim passes
+        through the same ledger gate as the daemon runner.
+        """
+        now = now or timezone.now()
+        result = {"state": "idle", "crawl": None, "claimed": 0, "skipped_periods": 0, "maintained": 0, "failed": 0}
+        self.reconcile_runs(now=now)
+        if self.runs.filter(status=CrawlScheduleRun.StatusChoices.CLAIMED).exists():
+            result["state"] = "busy"
+            return result
+
+        anchor = self.scheduling_anchor
+        try:
+            if force:
+                from archivebox.crawls.schedule_util import next_planned_run
+
+                target = next_planned_run(self.schedule, self.timezone_name, anchor)
+                window_end = target.planned_at
+            else:
+                target = None
+                window_end = now
+            fires, truncated = iter_planned_runs(self.schedule, self.timezone_name, anchor, window_end)
+        except ValueError as exc:
+            message = str(exc)
+            code = REASON_INVALID_TIMEZONE if "timezone" in message.lower() else REASON_INVALID_CRON
+            self.record_error(code, message, now=now)
+            result["state"] = "error"
+            return result
+        self._clear_error()
+
+        owner = current_schedule_owner(source)
+        for planned in fires:
+            if not planned.is_fireable:
+                if self._record_skipped_period(planned, source=source, owner=owner, now=now) is not None:
+                    result["skipped_periods"] += 1
+        due_runs = [planned for planned in fires if planned.is_fireable]
+        if not due_runs:
+            result["state"] = "skipped_dst" if result["skipped_periods"] else "idle"
+            return result
+
+        if len(due_runs) > self.max_backfill_runs:
+            dropped = due_runs[: -self.max_backfill_runs]
+            due_runs = due_runs[-self.max_backfill_runs :]
+            self._record_backfill_skip(dropped, truncated=truncated, now=now)
+            result["skipped_periods"] += len(dropped)
+
+        for planned in due_runs:
+            run = self.claim_run(planned, source=source, owner=owner, now=now)
+            if run is None:
+                # Another runner/admin already holds this exact period.
+                result["state"] = "busy"
+                break
+            result["claimed"] += 1
+            if run.run_kind == "update":
+                self._execute_claimed_maintenance(run, now=now)
+                if run.status == CrawlScheduleRun.StatusChoices.SUCCEEDED:
+                    result["maintained"] += 1
+                    result["state"] = "succeeded"
+                else:
+                    result["failed"] += 1
+                    result["state"] = "failed"
+                    break
+            else:
+                result["crawl"] = run.crawl
+                result["state"] = "enqueued"
+        if result["state"] == "idle" and result["skipped_periods"]:
+            result["state"] = "skipped_dst"
+        return result
+
+    @classmethod
+    def dispatch_due(
+        cls,
+        *,
+        now=None,
+        source: str = "runner",
+        force: bool = False,
+        schedules=None,
+    ) -> dict:
+        """Evaluate all enabled schedules through the shared ledger gate."""
+        now = now or timezone.now()
+        queryset = schedules if schedules is not None else cls.objects.filter(is_enabled=True)
+        summary = {
+            "schedules": 0,
+            "enqueued": 0,
+            "maintained": 0,
+            "skipped": 0,
+            "claimed": 0,
+            "skipped_periods": 0,
+            "failed": 0,
+            "errors": 0,
+            "runs": [],
+        }
+        for schedule in queryset.select_related("template", "template__created_by"):
+            summary["schedules"] += 1
+            try:
+                outcome = schedule.evaluate(now=now, source=source, force=force)
+            except Exception as exc:
+                if _is_database_lock_error(exc):
+                    # Another runner/admin process holds the write lock for
+                    # this exact schedule tick. Skip it; the unique ledger
+                    # constraint plus next tick's evaluation remain the gate.
+                    logger.info("CrawlSchedule %s claim skipped: database locked by another process", schedule.pk)
+                    summary["skipped"] += 1
+                    summary["runs"].append({"schedule_id": str(schedule.pk), "state": "locked"})
+                    continue
+                logger.warning("CrawlSchedule %s evaluation failed: %s", schedule.pk, exc, exc_info=True)
+                summary["errors"] += 1
+                summary["runs"].append({"schedule_id": str(schedule.pk), "state": "error", "error": str(exc)[:512]})
+                continue
+            state = outcome["state"]
+            summary["runs"].append({"schedule_id": str(schedule.pk), "state": state})
+            summary["claimed"] += outcome["claimed"]
+            summary["skipped_periods"] += outcome["skipped_periods"]
+            summary["failed"] += outcome["failed"]
+            if state == "enqueued":
+                summary["enqueued"] += 1
+            elif state == "busy":
+                summary["skipped"] += 1
+            summary["maintained"] += outcome["maintained"]
+        return summary
 
     def dispatch(self, queued_at=None) -> "Crawl | None":
-        """Run maintenance directly or enqueue one ordinary Crawl."""
-        queued_at = queued_at or timezone.now()
-        if self.kind == "update":
-            from archivebox.cli.archivebox_update import run_scheduled_maintenance
-
-            run_scheduled_maintenance()
-            type(self).objects.filter(pk=self.pk).update(modified_at=queued_at)
-            self.modified_at = queued_at
-            return None
-        return self.enqueue(queued_at=queued_at)
+        """Legacy entry point: claim the next planned period and run it now."""
+        outcome = self.evaluate(now=queued_at or timezone.now(), source="legacy_dispatch", force=True)
+        if outcome["state"] == "error":
+            raise ValueError(self.last_error_message or "Schedule evaluation failed")
+        return outcome.get("crawl")
 
     def enqueue(self, queued_at=None) -> "Crawl":
         from archivebox.config.common import build_crawl_config_snapshot
@@ -145,6 +650,12 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
             retry_at=queued_at,
             created_by=template.created_by,
         )
+
+
+def _schedule_field_value(schedule: CrawlSchedule, field: str):
+    if field == "template_id":
+        return schedule.template_id
+    return getattr(schedule, field)
 
 
 class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWithHealthStats, ModelWithQueue):
@@ -264,6 +775,14 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         )
         self.status = self.StatusChoices.SEALED
         self.retry_at = now
+        # Release the schedule ledger claim so the next period can be claimed;
+        # a tight conditional UPDATE keeps this on the same scheduler-row path.
+        CrawlScheduleRun.objects.filter(crawl=self, status=CrawlScheduleRun.StatusChoices.CLAIMED).update(
+            status=CrawlScheduleRun.StatusChoices.CANCELLED,
+            reason=REASON_CRAWL_CANCELLED,
+            finished_at=now,
+            modified_at=now,
+        )
 
     def schedule_child_snapshots_for_sealing(self) -> int:
         from archivebox.core.models import Snapshot

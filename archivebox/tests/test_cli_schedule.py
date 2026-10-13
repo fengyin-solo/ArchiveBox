@@ -46,6 +46,64 @@ def test_schedule_run_all_enqueues_scheduled_crawl(initialized_archive):
     assert queued_count >= 1
 
 
+def test_schedule_run_all_second_call_respects_ledger_gate(initialized_archive):
+
+    env = cli_env(disable_extractors=True)
+    run_archivebox_cmd(
+        ["schedule", "--every=daily", "--depth=0", "https://example.com"],
+        check=True,
+    )
+
+    first = run_archivebox_cmd(["schedule", "--run-all"], env=env)
+    second = run_archivebox_cmd(["schedule", "--run-all"], env=env)
+
+    assert first.returncode == 0
+    assert second.returncode == 0
+    assert "Enqueued 1 scheduled crawl" in first.stdout
+    assert "Enqueued 0 scheduled crawl" in second.stdout
+    assert "Skipped 1 schedule" in second.stdout
+
+    with use_archivebox_db(initialized_archive):
+        from archivebox.crawls.models import CrawlScheduleRun
+
+        total_crawls = Crawl.objects.count()
+        claimed_runs = CrawlScheduleRun.objects.filter(status="claimed").count()
+
+    assert total_crawls == 2  # template + one claimed run only
+    assert claimed_runs == 1
+
+
+def test_schedule_accepts_timezone_and_max_backfill_options(initialized_archive):
+
+    create = run_archivebox_cmd(
+        [
+            "schedule",
+            "--every=daily",
+            "--timezone=America/New_York",
+            "--max-backfill=3",
+            "--depth=0",
+            "https://example.com",
+        ],
+        check=True,
+    )
+    assert "timezone=America/New_York" in create.stdout
+    assert "max_backfill=3" in create.stdout
+
+    show = run_archivebox_cmd(["schedule", "--show"])
+    assert "tz=America/New_York" in show.stdout
+
+    with use_archivebox_db(initialized_archive):
+        row = CrawlSchedule.objects.get()
+        assert row.timezone_name == "America/New_York"
+        assert row.max_backfill_runs == 3
+
+    invalid = run_archivebox_cmd(
+        ["schedule", "--every=daily", "--timezone=Mars/Olympus", "https://example.com"],
+    )
+    assert invalid.returncode != 0
+    assert "Invalid timezone" in (invalid.stderr + invalid.stdout)
+
+
 def test_schedule_without_import_path_creates_maintenance_schedule(initialized_archive):
 
     result = run_archivebox_cmd(
@@ -142,6 +200,8 @@ def test_schedule_help_lists_schedule_options(initialized_archive):
     assert "--show" in result.stdout
     assert "--clear" in result.stdout
     assert "--run-all" in result.stdout
+    assert "--timezone" in result.stdout
+    assert "--max-backfill" in result.stdout
 
 
 @pytest.mark.timeout(180)

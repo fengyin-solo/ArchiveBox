@@ -88,6 +88,92 @@ class TestCrawlScheduleAdmin:
         assert response.status_code == 200
         assert b"Daily crawl" in response.content
 
+    @pytest.mark.django_db(transaction=True)
+    def test_crawlschedule_change_view_shows_ledger_and_timezone_fields(self, client, admin_user, crawl):
+        from archivebox.crawls.models import CrawlSchedule
+
+        schedule = CrawlSchedule.objects.create(
+            label="Ledger crawl",
+            notes="",
+            schedule="0 0 * * *",
+            timezone_name="America/New_York",
+            max_backfill_runs=3,
+            template=crawl,
+            created_by=admin_user,
+        )
+        client.force_login(admin_user)
+
+        response = client.get(
+            reverse("admin:crawls_crawlschedule_change", args=[schedule.pk]),
+            HTTP_HOST=ADMIN_TEST_HOST,
+        )
+
+        assert response.status_code == 200
+        assert b'name="timezone_name"' in response.content
+        assert b'name="max_backfill_runs"' in response.content
+        assert b"America/New_York" in response.content
+        assert b"Run Ledger State" in response.content
+        assert b"Last Error" in response.content
+
+    @pytest.mark.django_db(transaction=True)
+    def test_crawlschedulerun_changelist_lists_ledger_and_filters(self, client, admin_user, crawl):
+        from archivebox.crawls.models import CrawlSchedule, CrawlScheduleRun
+
+        schedule = CrawlSchedule.objects.create(
+            label="Ledger crawl",
+            notes="",
+            schedule="daily",
+            template=crawl,
+            created_by=admin_user,
+        )
+        schedule.evaluate(now=None, source="manual_run_all", force=True)
+
+        client.force_login(admin_user)
+        url = reverse("admin:crawls_crawlschedulerun_changelist")
+
+        response = client.get(url, HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200
+        assert b"claimed" in response.content
+
+        filtered = client.get(f"{url}?status=claimed", HTTP_HOST=ADMIN_TEST_HOST)
+        assert filtered.status_code == 200
+        assert filtered.context["cl"].queryset.count() == CrawlScheduleRun.objects.filter(status="claimed").count()
+        assert filtered.context["cl"].queryset.count() >= 1
+
+        # Ledger is read-only: no add permission.
+        add_response = client.get(reverse("admin:crawls_crawlschedulerun_add"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert add_response.status_code in (403, 302)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_editing_template_crawl_in_admin_cancels_unstarted_claim(self, client, admin_user, crawl):
+        from django.contrib import admin
+        from django.test import RequestFactory
+
+        from archivebox.crawls.admin import CrawlAdmin
+        from archivebox.crawls.models import CrawlSchedule, CrawlScheduleRun
+
+        schedule = CrawlSchedule.objects.create(
+            label="Template edit crawl",
+            notes="",
+            schedule="daily",
+            template=crawl,
+            created_by=admin_user,
+        )
+        outcome = schedule.evaluate(now=None, source="manual_run_all", force=True)
+        claimed_crawl = outcome["crawl"]
+        assert claimed_crawl.status == "queued"
+
+        request = RequestFactory().post("/admin/crawls/crawl/")
+        request.user = admin_user
+        crawl.urls = "https://example.com/template-edited"
+        CrawlAdmin(Crawl, admin.site).save_model(request, crawl, form=None, change=True)
+
+        run = CrawlScheduleRun.objects.get(schedule=schedule)
+        assert run.status == CrawlScheduleRun.StatusChoices.CANCELLED
+        assert run.reason == "template_modified"
+        claimed_crawl.refresh_from_db()
+        assert claimed_crawl.status == "sealed"
+
 
 def test_crawl_admin_change_view_renders_tag_editor_widget(admin_client, crawl):
     response = admin_client.get(

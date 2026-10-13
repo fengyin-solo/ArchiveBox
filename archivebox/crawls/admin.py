@@ -31,7 +31,7 @@ from archivebox.core.permissions import (
     normalize_permissions,
 )
 from archivebox.core.widgets import TagEditorWidget, URLFiltersWidget
-from archivebox.crawls.models import Crawl, CrawlSchedule
+from archivebox.crawls.models import Crawl, CrawlSchedule, CrawlScheduleRun
 from archivebox.misc.paginators import AcceleratedPaginator
 from archivebox.progressmonitor.views import progress_endpoint
 from archivebox.workers.models import RETRY_AT_MAX
@@ -718,6 +718,22 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         self.crawl_admin_base_config = None
         self.stop_reason_cache = {}
 
+    def save_model(self, request, obj, form, change):
+        from archivebox.crawls.models import TEMPLATE_CONTENT_FIELDS
+
+        # A schedule template is the sealed source Crawl copied into each
+        # scheduled run. Editing its content must release any claim that has
+        # not STARTED so the next claimed run uses the new definition.
+        previous = None
+        if change and obj.pk:
+            previous = Crawl.objects.filter(pk=obj.pk).values(*TEMPLATE_CONTENT_FIELDS).first()
+        super().save_model(request, obj, form, change)
+        if previous is not None:
+            changed_fields = {field for field in TEMPLATE_CONTENT_FIELDS if previous.get(field) != getattr(obj, field, None)}
+            if changed_fields:
+                for schedule in CrawlSchedule.objects.filter(template_id=obj.pk):
+                    schedule.invalidate_for_template_change(changed_fields)
+
     class Media:
         css: ClassVar[dict[str, tuple[str, ...]]] = {"all": ("admin/crawls/crawl_change.css",)}
         js: ClassVar[tuple[str, ...]] = ("admin/crawls/crawl_admin.js",)
@@ -1212,11 +1228,40 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
 
 
 class CrawlScheduleAdmin(BaseModelAdmin):
-    list_display = ("id", "created_at", "created_by", "label", "notes", "template_str", "crawls", "num_crawls", "num_snapshots")
+    list_display = (
+        "id",
+        "created_at",
+        "created_by",
+        "is_enabled",
+        "label",
+        "notes",
+        "template_str",
+        "next_run_display",
+        "crawls",
+        "num_crawls",
+        "num_snapshots",
+    )
     sort_fields = ("id", "created_at", "created_by", "label", "notes", "template_str")
     search_fields = ("id", "created_by__username", "label", "notes", "schedule_id", "template_id", "template__urls")
 
-    readonly_fields = ("created_at", "modified_at", "crawls", "snapshots")
+    readonly_fields = (
+        "created_at",
+        "modified_at",
+        "next_run_display",
+        "last_planned_run_at",
+        "missed_runs_skipped",
+        "last_skip_at",
+        "last_skip_count",
+        "last_skip_first_at",
+        "last_skip_last_at",
+        "last_skip_reason",
+        "last_error_at",
+        "last_error_code",
+        "last_error_message",
+        "crawls",
+        "snapshots",
+    )
+    list_filter = ("is_enabled", "timezone_name", "last_skip_reason", "last_error_code")
     autocomplete_fields = ("template", "created_by")
 
     fieldsets = (
@@ -1230,7 +1275,30 @@ class CrawlScheduleAdmin(BaseModelAdmin):
         (
             "Configuration",
             {
-                "fields": ("is_enabled", "schedule", "template"),
+                "fields": ("is_enabled", "schedule", "timezone_name", "max_backfill_runs", "template"),
+                "classes": ("card",),
+            },
+        ),
+        (
+            "Run Ledger State",
+            {
+                "fields": (
+                    "next_run_display",
+                    "last_planned_run_at",
+                    "missed_runs_skipped",
+                    "last_skip_at",
+                    "last_skip_count",
+                    "last_skip_first_at",
+                    "last_skip_last_at",
+                    "last_skip_reason",
+                ),
+                "classes": ("card",),
+            },
+        ),
+        (
+            "Last Error",
+            {
+                "fields": ("last_error_at", "last_error_code", "last_error_message"),
                 "classes": ("card",),
             },
         ),
@@ -1257,7 +1325,6 @@ class CrawlScheduleAdmin(BaseModelAdmin):
         ),
     )
 
-    list_filter = ("created_by",)
     ordering = ("-created_at",)
     list_per_page = 100
     actions = ("delete_selected",)
@@ -1309,6 +1376,13 @@ class CrawlScheduleAdmin(BaseModelAdmin):
     def template_str(self, obj):
         return format_html('<a href="{}">{}</a>', obj.template.admin_change_url, obj.template)
 
+    @admin.display(description="Next Run")
+    def next_run_display(self, obj):
+        try:
+            return obj.next_run_at.isoformat()
+        except Exception as exc:
+            return format_html('<span title="{}">{}</span>', str(exc), obj.last_error_code or "invalid schedule")
+
     @admin.display(description="# Crawls", ordering="crawl_count")
     def num_crawls(self, obj):
         count = obj.__dict__.get("crawl_count")
@@ -1339,6 +1413,40 @@ class CrawlScheduleAdmin(BaseModelAdmin):
         )
 
 
+class CrawlScheduleRunAdmin(BaseModelAdmin):
+    """Read-only audit view over the persistent per-period claim ledger."""
+
+    list_display = (
+        "id",
+        "schedule",
+        "planned_at",
+        "started_at",
+        "finished_at",
+        "status",
+        "reason",
+        "run_kind",
+        "owner",
+        "source",
+        "crawl",
+    )
+    list_filter = ("status", "reason", "run_kind", "source")
+    search_fields = ("id", "schedule__id", "schedule__label", "crawl__id", "owner")
+    ordering = ("-planned_at",)
+    list_per_page = 100
+    list_select_related = ("schedule", "crawl")
+    actions = None
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 def register_admin(admin_site):
     admin_site.register(Crawl, CrawlAdmin)
     admin_site.register(CrawlSchedule, CrawlScheduleAdmin)
+    admin_site.register(CrawlScheduleRun, CrawlScheduleRunAdmin)

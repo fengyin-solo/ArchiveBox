@@ -96,6 +96,8 @@ class ScheduleCommandSchema(Schema):
     update: bool = False
     overwrite: bool = False
     clear: bool = False
+    timezone: str | None = None
+    max_backfill: int | None = None
 
 
 class ListCommandSchema(SnapshotFilterCommandSchema):
@@ -241,6 +243,8 @@ def cli_schedule(request: HttpRequest, args: ScheduleCommandSchema):
         tag=args.tag,
         depth=args.depth,
         config=config_overrides or None,
+        timezone=args.timezone,
+        max_backfill=args.max_backfill if args.max_backfill is not None else 1,
     )
 
     stdout = request.__dict__.get("stdout")
