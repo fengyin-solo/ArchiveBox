@@ -568,6 +568,33 @@ class SearchBackendConfig(BaseConfigSet):
     SEARCH_BACKEND_ENGINE: str = Field(default="sonic", json_schema_extra={"scope": _SCOPE_CRAWL_EXECUTION})
 
 
+class MCPConfig(BaseConfigSet):
+    """Operational limits for the stdio MCP server (``archivebox mcp``)."""
+
+    toml_section_header: str = "MCP_CONFIG"
+    _scope: str = PrivateAttr(default=_SCOPE_SERVER)
+
+    MCP_READ_ONLY: bool = Field(
+        default=False,
+        alias="ARCHIVEBOX_MCP_READ_ONLY",
+        description="Refuse every mutating tools/call (add/shell/create/update/delete) while still serving reads and resources.",
+    )
+    MCP_AUDIT_CAPACITY: int = Field(
+        default=1000,
+        ge=1,
+        le=1_000_000,
+        alias="ARCHIVEBOX_MCP_AUDIT_CAPACITY",
+        description="Maximum number of MCP tool/resource audit entries kept in memory; oldest entries are evicted first.",
+    )
+    MCP_RESOURCES_PAGE_SIZE: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        alias="ARCHIVEBOX_MCP_RESOURCES_PAGE_SIZE",
+        description="Maximum resources returned by one resources/list response.",
+    )
+
+
 def _plugin_user_config_value(value: Any) -> str:
     if isinstance(value, Path):
         return str(value)
@@ -647,6 +674,7 @@ class ArchiveBoxBaseConfig(
     ArchivingConfig,
     SearchBackendConfig,
     LDAPConfig,
+    MCPConfig,
 ):
     """Merged, typed ArchiveBox config.
 
@@ -677,6 +705,7 @@ class ArchiveBoxBaseConfig(
             ArchivingConfig,
             SearchBackendConfig,
             LDAPConfig,
+            MCPConfig,
         )
 
     @classmethod
@@ -1285,4 +1314,5 @@ def get_all_configs() -> dict[str, BaseConfigSet]:
         "ARCHIVING_CONFIG": ArchivingConfig.model_validate(resolved),
         "SEARCH_BACKEND_CONFIG": SearchBackendConfig.model_validate(resolved),
         "LDAP_CONFIG": LDAPConfig.model_validate(resolved),
+        "MCP_CONFIG": MCPConfig.model_validate(resolved),
     }
